@@ -47,6 +47,20 @@ async def fetch_health_data(user_token: str):
         except Exception as e:
             return {"error": f"Failed to fetch health data: {str(e)}"}
 
+async def fetch_profile_data(user_token: str):
+    """Helper tool to fetch user profile data from Laravel"""
+    headers = {
+        "Authorization": f"Bearer {user_token}",
+        "Accept": "application/json"
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{LARAVEL_API_URL}/user/profile", headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"error": f"Failed to fetch profile data: {str(e)}"}
+
 @app.post("/chat/stream")
 async def chat_stream(request: Request, chat_req: ChatRequest):
     # Extract Bearer token from the incoming request
@@ -109,13 +123,17 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
         types.Content(role='user', parts=[types.Part.from_text(text=chat_req.message)])
     )
 
-    # 3. Define the tool
-    health_tool = types.Tool(
+    # 3. Define tools available to the AI
+    ai_tools = types.Tool(
         function_declarations=[
             types.FunctionDeclaration(
                 name="get_health_data",
-                description="Fetches the user's current health records, charts, and metrics from the database.",
-            )
+                description="Fetches the user's current health records, charts, and metrics from the database. Also includes the user's profile (age, gender, country, address). Use this when the user asks about their health, medical records, or when profile context would help answer a health question.",
+            ),
+            types.FunctionDeclaration(
+                name="get_user_profile",
+                description="Fetches the user's personal profile information: name, age, gender, country, address, email, and phone. Use this ONLY when the user asks about their personal details and does NOT need health records.",
+            ),
         ]
     )
 
@@ -130,7 +148,7 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    tools=[health_tool],
+                    tools=[ai_tools],
                     temperature=0.7,
                 ),
             )
@@ -209,7 +227,20 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                             # Append any extracted text parts into a new user content block
                             if extracted_texts:
                                 contents.append(types.Content(role='user', parts=extracted_texts))
+
+                        elif function_call.name == "get_user_profile":
+                            # Yield a status message so the user knows it's fetching their profile
+                            yield "*(Fetching profile...)*\n\n"
                             
+                            # Execute the profile tool
+                            profile_data = await fetch_profile_data(user_token)
+                            
+                            # Add tool response to contents
+                            function_parts = [types.Part.from_function_response(
+                                name="get_user_profile",
+                                response=profile_data
+                            )]
+                            contents.append(types.Content(role='user', parts=function_parts))
                             
                     # Make a second call to get the actual answer based on the tool data
                     second_response = gemini_client.models.generate_content_stream(
@@ -217,7 +248,7 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                         contents=contents,
                         config=types.GenerateContentConfig(
                             system_instruction=system_instruction,
-                            tools=[health_tool],
+                            tools=[ai_tools],
                             temperature=0.7,
                         ),
                     )
@@ -231,6 +262,7 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                 elif chunk.text:
                     full_response += chunk.text
                     yield chunk.text
+
 
             # 4. Save the interaction to Laravel after stream finishes
             async with httpx.AsyncClient() as save_client:
