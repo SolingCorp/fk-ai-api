@@ -258,7 +258,21 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                                         uploaded = await asyncio.to_thread(
                                             gemini_client.files.upload, file=path
                                         )
-                                        uploaded_files.append(uploaded)
+                                        # Wait for Gemini to finish processing the file.
+                                        # Uploading is async on Gemini's side — the file moves from
+                                        # PROCESSING → ACTIVE before it can be used in a prompt.
+                                        max_wait = 30  # seconds
+                                        waited = 0
+                                        while uploaded.state.name == "PROCESSING" and waited < max_wait:
+                                            await asyncio.sleep(2)
+                                            waited += 2
+                                            uploaded = await asyncio.to_thread(
+                                                gemini_client.files.get, name=uploaded.name
+                                            )
+                                        if uploaded.state.name == "ACTIVE":
+                                            uploaded_files.append(uploaded)
+                                        else:
+                                            print(f"File {uploaded.name} did not become ACTIVE (state: {uploaded.state.name}), skipping.")
                                     except Exception as e:
                                         print(f"Failed to upload {path}: {e}")
 
