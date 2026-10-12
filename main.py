@@ -33,6 +33,11 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[int] = None
     message: str
 
+class SharedChatRequest(BaseModel):
+    access_key: str
+    conversation_id: Optional[int] = None
+    message: str
+
 # ---------------------------------------------------------------------------
 # Laravel helper functions — all with explicit timeouts so a slow/dead
 # Laravel process never hangs a uvicorn worker indefinitely.
@@ -65,6 +70,24 @@ async def fetch_profile_data(user_token: str):
             return response.json()
         except Exception as e:
             return {"error": f"Failed to fetch profile data: {str(e)}"}
+
+async def fetch_shared_health_data(user_token: str, access_key: str):
+    """Helper tool to fetch shared patient health data for an access key from Laravel"""
+    headers = {
+        "Authorization": f"Bearer {user_token}",
+        "Accept": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(f"{LARAVEL_API_URL}/record_access/view/{access_key}/ai/health-data", headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (402, 403):
+                return {"error": "Access to this user's records has been revoked or expired."}
+            return {"error": f"Failed to fetch shared health data: {e.response.text}"}
+        except Exception as e:
+            return {"error": f"Failed to fetch shared health data: {str(e)}"}
 
 # ---------------------------------------------------------------------------
 # Non-blocking Gemini streaming helper
@@ -347,6 +370,213 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
 
         except asyncio.CancelledError:
             # Client disconnected mid-stream — exit cleanly, free the worker
+            return
+        except Exception as e:
+            yield f"\n\nError: {str(e)}"
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/plain",
+        headers={
+            "X-Conversation-ID": str(conversation_id),
+            "Access-Control-Expose-Headers": "X-Conversation-ID",
+        },
+    )
+
+# ---------------------------------------------------------------------------
+# Shared Records Chat endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/chat/shared/stream")
+async def chat_shared_stream(request: Request, chat_req: SharedChatRequest):
+    # --- Auth ---
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    user_token = auth_header.replace("Bearer ", "").strip()
+    headers = {
+        "Authorization": f"Bearer {user_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    # --- 1. Fetch chat context for this shared access from Laravel ---
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        payload = {}
+        if chat_req.conversation_id:
+            payload["conversation_id"] = chat_req.conversation_id
+
+        context_res = await client.get(
+            f"{LARAVEL_API_URL}/record_access/view/{chat_req.access_key}/ai/context",
+            headers=headers,
+            params=payload,
+        )
+
+        if context_res.status_code != 200:
+            error_message = "Access revoked or unauthorized by backend"
+            try:
+                error_data = context_res.json()
+                if isinstance(error_data, dict) and "message" in error_data:
+                    error_message = error_data["message"]
+            except Exception:
+                pass
+            raise HTTPException(status_code=context_res.status_code, detail=error_message)
+
+        context_data = context_res.json()
+        conversation_id = context_data.get("conversation_id")
+        db_messages = context_data.get("messages", [])
+
+    # --- 2. Build conversation history for Gemini ---
+    contents = []
+    system_instruction = (
+        "You are an expert health and wellness assistant. "
+        "You are assisting an authorized viewer who has access to view a patient's shared health records. "
+        "You have a tool to fetch the patient's shared health records and profile. "
+        "Only answer questions and provide insights based on the permitted records. "
+        "Be concise, helpful, and format responses in Markdown."
+    )
+
+    for msg in db_messages:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(
+            types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
+        )
+
+    contents.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=chat_req.message)])
+    )
+
+    # --- 3. Define AI tools for Shared Records ---
+    ai_tools = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="get_shared_health_data",
+                description=(
+                    "Fetches the patient's permitted shared health records and profile (name, age, gender, country) "
+                    "that were explicitly shared with the current viewer. "
+                    "Use this when answering questions about the patient's shared medical records or health status."
+                ),
+            ),
+        ]
+    )
+
+    gemini_config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        tools=[ai_tools],
+        temperature=0.7,
+    )
+
+    # --- 4. Streaming response generator ---
+    async def stream_generator():
+        full_response = ""
+
+        try:
+            async for chunk in gemini_stream_chunks(list(contents), gemini_config):
+                if await request.is_disconnected():
+                    return
+
+                if chunk.function_calls:
+                    contents.append(chunk.candidates[0].content)
+
+                    for function_call in chunk.function_calls:
+                        if function_call.name == "get_shared_health_data":
+                            yield "*(Fetching shared health records...)*\n\n"
+                            health_data = await fetch_shared_health_data(user_token, chat_req.access_key)
+
+                            uploaded_files = []
+                            extracted_texts = []
+
+                            async def handle_file(path, name_for_log=None):
+                                if not path or not os.path.exists(path):
+                                    return
+                                file_name = name_for_log or os.path.basename(path)
+                                if path.endswith(".docx"):
+                                    try:
+                                        doc = await asyncio.to_thread(docx.Document, path)
+                                        doc_content = "\n".join(p.text for p in doc.paragraphs)
+                                        part = types.Part.from_text(
+                                            text=f"\n\n--- Contents of {file_name} ---\n{doc_content}\n---------------------------\n"
+                                        )
+                                        extracted_texts.append(part)
+                                    except Exception as e:
+                                        print(f"Failed to read docx {path}: {e}")
+                                else:
+                                    try:
+                                        uploaded = await asyncio.to_thread(
+                                            gemini_client.files.upload, file=path
+                                        )
+                                        max_wait = 30
+                                        waited = 0
+                                        while uploaded.state.name == "PROCESSING" and waited < max_wait:
+                                            await asyncio.sleep(2)
+                                            waited += 2
+                                            uploaded = await asyncio.to_thread(
+                                                gemini_client.files.get, name=uploaded.name
+                                            )
+                                        if uploaded.state.name == "ACTIVE":
+                                            uploaded_files.append(uploaded)
+                                        else:
+                                            print(f"File {uploaded.name} did not become ACTIVE, skipping.")
+                                    except Exception as e:
+                                        print(f"Failed to upload {path}: {e}")
+
+                            for record in health_data.get("health_records", []):
+                                if "detail_file_absolute_path" in record:
+                                    path = record["detail_file_absolute_path"]
+                                    if path and os.path.exists(path):
+                                        yield f"*(Processing document: {os.path.basename(path)}...)*\n\n"
+                                        await handle_file(path)
+
+                                if "additional_files" in record:
+                                    for f in record["additional_files"]:
+                                        path = f.get("absolute_path")
+                                        if path and os.path.exists(path):
+                                            yield f"*(Processing additional file: {f.get('name', 'document')}...)*\n\n"
+                                            await handle_file(path, f.get("name"))
+
+                            contents.append(
+                                types.Content(
+                                    role="user",
+                                    parts=[types.Part.from_function_response(
+                                        name="get_shared_health_data",
+                                        response=health_data,
+                                    )],
+                                )
+                            )
+                            for uf in uploaded_files:
+                                contents.append(uf)
+                            if extracted_texts:
+                                contents.append(types.Content(role="user", parts=extracted_texts))
+
+                    # Second Gemini call after tool results
+                    async for second_chunk in gemini_stream_chunks(list(contents), gemini_config):
+                        if await request.is_disconnected():
+                            return
+                        if second_chunk.text:
+                            full_response += second_chunk.text
+                            yield second_chunk.text
+
+                    break
+
+                elif chunk.text:
+                    full_response += chunk.text
+                    yield chunk.text
+
+            # --- 5. Save interaction to Laravel Shared AI endpoint ---
+            if full_response and not await request.is_disconnected():
+                async with httpx.AsyncClient(timeout=30.0) as save_client:
+                    await save_client.post(
+                        f"{LARAVEL_API_URL}/record_access/view/{chat_req.access_key}/ai/save",
+                        headers=headers,
+                        json={
+                            "conversation_id": conversation_id,
+                            "user_message": chat_req.message,
+                            "assistant_message": full_response,
+                        },
+                    )
+
+        except asyncio.CancelledError:
             return
         except Exception as e:
             yield f"\n\nError: {str(e)}"
